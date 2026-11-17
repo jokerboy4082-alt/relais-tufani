@@ -3,10 +3,13 @@
 # Source : le depot relais-tufani clone a la creation du codespace.
 # Idempotent : reexecuter ne casse rien (reinstalle seulement ce qui manque).
 set -u
-SRC="$HOME/workspaces/relais-tufani"
+SRC=""
+for D in /workspaces/relais-tufani "$HOME/workspaces/relais-tufani" "$HOME/relais-tufani"; do
+  [ -f "$D/install-chain-cs.sh" ] && SRC="$D" && break
+done
 CHAIN="$HOME/opencode-chain"
 
-[ -d "$SRC" ] || { echo "ERREUR: $SRC absent (repo non clone ?)"; exit 1; }
+[ -n "$SRC" ] || { echo "ERREUR: depot relais-tufani introuvable"; exit 1; }
 
 echo "[install] harmonisation des fins de ligne..."
 sed -i 's/\r$//' "$SRC"/*.sh "$SRC"/agent/*.md 2>/dev/null
