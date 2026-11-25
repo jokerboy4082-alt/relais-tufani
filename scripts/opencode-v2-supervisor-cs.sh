@@ -1,15 +1,20 @@
 #!/bin/bash
-# Superviseur OpenCode v2 + pont Tor + adaptateur Hermes (Codespace opencode-v2).
+# Superviseur OpenCode v2 + pont HTTP->SOCKS + adaptateur Hermes (Codespace opencode-v2).
 #
-# CHAINE RESEAU :
+# CHAINE RESEAU (par defaut : IP DIRECTE du Codespace) :
 #   Hermes (PC) --SSH -L 8771--> Codespace
-#   OpenCode (Codespace) --HTTP_PROXY--> pont HTTP->SOCKS (Codespace:8899)
-#     --SOCKS5 -R 19050--> Tor dedie du PC (127.0.0.1:9150)
-#     --ControlPort -R 19051--> ControlPort Tor du PC (127.0.0.1:9151)
+#   OpenCode (Codespace) --sans proxy--> opencode.ai
 #
-# Pourquoi Tor : le quota free OpenCode est indexe sur l'IP de SORTIE. En
-# passant par Tor, l'IP change → le quota repart. Quand le pont detecte un
-# echec (quota epuise), il appelle rotate-tor.sh → SIGNAL NEWNYM → nouvelle IP.
+# Pourquoi IP directe : les IP de sortie Tor sont blacklistees par OpenCode
+# (verifie le 2026-11-25 : via Tor => 429 FreeUsageLimitError meme avec un
+# compte neuf et quota intact ; via IP directe => reponse OK). Le quota free
+# est donc lie au reseau, mais Tor EST le reseau bloque.
+#
+# MODE TOR (optionnel, pour les quotas IP par reseau) :
+#   TOR_MODE=1 → le trafic passe par le pont HTTP->SOCKS (relais Tor du PC
+#   via le tunnel SSH inverse -R 19050). Le pont force une rotation d'IP
+#   (SIGNAL NEWNYM) quand une connexion echoue.
+#   A n'utiliser que si les IP directes sont, elles aussi, a quota epuise.
 #
 # Les secrets (mot de passe du serveur OpenCode) ne sont jamais en clair :
 # ils sont generes au premier lancement dans un fichier chmod 600.
@@ -22,9 +27,9 @@ OC_PORT=49374
 ADAPTER_PORT=8771
 BRIDGE_PORT=8899
 SOCKS_PORT=19050
-CONTROL_PORT_REMOTE=19051
 SECRETS="$CHAIN/secrets"
 LOG_DIR="$CHAIN/logs"
+TOR_MODE="${TOR_MODE:-0}"
 
 export PATH="$HOME_DIR/.opencode/bin:$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
@@ -69,18 +74,26 @@ start_bridge() {
 }
 
 start_opencode() {
-  log "demarrage opencode service (via proxy Tor)"
+  if [ "$TOR_MODE" = "1" ]; then
+    log "demarrage opencode service (MODE TOR via proxy)"
+    PROXY_ENV=(
+      HTTP_PROXY="http://127.0.0.1:$BRIDGE_PORT"
+      HTTPS_PROXY="http://127.0.0.1:$BRIDGE_PORT"
+      http_proxy="http://127.0.0.1:$BRIDGE_PORT"
+      https_proxy="http://127.0.0.1:$BRIDGE_PORT"
+      ALL_PROXY="socks5h://127.0.0.1:$SOCKS_PORT"
+      all_proxy="socks5h://127.0.0.1:$SOCKS_PORT"
+    )
+  else
+    log "demarrage opencode service (IP DIRECTE du codespace)"
+    PROXY_ENV=()
+  fi
   cd "$CHAIN" || exit 1
-  OPENCODE_SERVER_PASSWORD="$OC_PASSWORD" \
-  OPENCODE_CONFIG="$CHAIN/opencode.json" \
-  HTTP_PROXY="http://127.0.0.1:$BRIDGE_PORT" \
-  HTTPS_PROXY="http://127.0.0.1:$BRIDGE_PORT" \
-  http_proxy="http://127.0.0.1:$BRIDGE_PORT" \
-  https_proxy="http://127.0.0.1:$BRIDGE_PORT" \
-  ALL_PROXY="socks5h://127.0.0.1:$SOCKS_PORT" \
-  all_proxy="socks5h://127.0.0.1:$SOCKS_PORT" \
-  nohup "$OC_BIN" serve --port "$OC_PORT" --hostname 127.0.0.1 \
-    >> "$LOG_DIR/opencode.log" 2>&1 &
+  env OPENCODE_SERVER_PASSWORD="$OC_PASSWORD" \
+      OPENCODE_CONFIG="$CHAIN/opencode.json" \
+      "${PROXY_ENV[@]}" \
+      nohup "$OC_BIN" serve --port "$OC_PORT" --hostname 127.0.0.1 \
+      >> "$LOG_DIR/opencode.log" 2>&1 &
   echo $! > "$SECRETS/opencode.pid"
   disown 2>/dev/null
 }
@@ -102,10 +115,11 @@ start_adapter() {
   disown 2>/dev/null
 }
 
-log "=== superviseur opencode-v2 (Tor + rotation) demarre (pid $$) ==="
+log "=== superviseur opencode-v2 demarre (pid $$) — TOR_MODE=$TOR_MODE ==="
 
 while true; do
-  if ! tcp_ok "$BRIDGE_PORT"; then
+  # Le pont Tor n'est demarre qu'en mode TOR.
+  if [ "$TOR_MODE" = "1" ] && ! tcp_ok "$BRIDGE_PORT"; then
     log "pont Tor KO -> relance"
     start_bridge
     sleep 3
