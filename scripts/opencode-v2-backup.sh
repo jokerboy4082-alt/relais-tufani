@@ -38,6 +38,11 @@ load_gh_token() {
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
 
+# Le token GitHub est indispensable pour le push (le clone HTTPS nu n'a pas
+# de credentials). Sans cet appel, $GH_TOKEN est vide et le push echoue.
+load_gh_token || { log "ECHEC chargement du token GitHub"; exit 1; }
+log "token GitHub $GH_USER charge (len=${#GH_TOKEN})"
+
 # ---- 1. scripts du pont (non secrets) ----
 SCRIPTS="opencode-v2-adapter.py opencode-v2-http-socks-bridge.py opencode-v2-tor.sh opencode-v2-tor-rotate.py opencode-v2-rotate-tor-cs.sh opencode-v2-supervisor-cs.sh opencode-v2-tunnel.sh opencode-v2-deploy.sh opencode-v2-backup.sh opencode-v2-opencode.json"
 
