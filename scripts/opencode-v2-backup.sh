@@ -147,9 +147,12 @@ git add -A state scripts RESTORE.md 2>/dev/null || true
 if git diff --cached --quiet; then
   log "rien a pousser (depot deja a jour)"
 else
+  git commit -m "sync: pont opencode v2 complet (tor + rotation) $(date +%F)" >/dev/null 2>&1 \
+    || { log "ECHEC commit"; exit 1; }
+  # On pousse via une URL qui porte le token, puis on restaure l'URL propre
+  # (le clone HTTPS nu n'a pas de credentials).
   git remote set-url origin "https://$GH_USER:${GH_TOKEN}@github.com/$REPO.git"
-  if git commit -m "sync: pont opencode v2 complet (tor + rotation) $(date +%F)" >/dev/null 2>&1 \
-    && git push origin HEAD:main >/dev/null 2>&1; then
+  if git push origin HEAD:main >/dev/null 2>&1; then
     git remote set-url origin "https://github.com/$REPO.git"
     log "depot synchronise sur $REPO"
   else
@@ -158,3 +161,4 @@ else
     exit 1
   fi
 fi
+exit 0
