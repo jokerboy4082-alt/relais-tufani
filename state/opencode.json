@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "hermes-brain": {
+      "description": "Cerveau LLM pour Hermes. Ne peut pas executer d'action : toute action doit etre demandee au client Hermes.",
+      "mode": "primary",
+      "system": "Tu es le CERVEAU d'un agent qui executes les actions pour toi. Tu ne peux rien executer toi-meme : quand une action est necessaire, tu DEMANDES un outil au client (le client l'executera et te renverra le resultat). Ne pretend JAMAIS avoir execute une commande ou cree un fichier. Reponds en francais sauf indication contraire.",
+      "permissions": [
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "list", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "*", "effect": "deny" },
+        { "action": "write", "resource": "*", "effect": "deny" },
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "patch", "resource": "*", "effect": "deny" },
+        { "action": "webfetch", "resource": "*", "effect": "deny" },
+        { "action": "websearch", "resource": "*", "effect": "deny" },
+        { "action": "*", "resource": "*", "effect": "deny" }
+      ]
+    }
+  }
+}
