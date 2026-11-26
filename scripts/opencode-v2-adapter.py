@@ -453,12 +453,127 @@ def _example_tool(action_tools):
     return "terminal", [("command", "ls -la")]
 
 
+# Variantes d'effort exposees par OpenCode (provider/model#variant).
+# Le niveau de raisonnement est porte par la VARIANTE du modele, pas par un
+# parametre separe : c'est la mecanique native d'OpenCode v2.
+EFFORT_VARIANTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+# Alias Hermes : nom court -> (modele opencode, variante d'effort)
+EFFORT_ALIASES = {
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "mid": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "x-high": "xhigh",
+    "max": "max",
+}
+
+# Variantes reellement acceptees par chaque modele OpenCode (verifie le
+# 2026-11-26 sur /api/model). Un modele sans variante n'accepte pas d'effort :
+# lui en envoyer une fait echouer la requete. Les variantes non supportees
+# sont donc repliees sur la meilleure variante disponible.
+MODEL_VARIANTS = {
+    "opencode/tidepool-alpha-free": ("minimal", "low", "medium", "high", "xhigh", "max"),
+    "opencode/beam-free": ("low", "medium", "high", "xhigh", "max"),
+    "opencode/flint-40b-free": ("low", "medium", "high", "xhigh", "max"),
+    "opencode/deepseek-v4.1-flash-free": ("low", "high", "max"),
+    "opencode/hy4-flash-free": ("none", "high"),
+    "opencode/iceman-free": (),
+    "opencode/mimo-v2.6-flash-free": (),
+    "opencode/nemotron-3.5-lightning-free": (),
+    "opencode/big-pickle": (),
+    "opencode/nemotron-3.5-super-vl-free": (),
+}
+
+# Ordre de preference pour replier une variante non supportee.
+_VARIANT_FALLBACK = ("max", "xhigh", "high", "medium", "low", "minimal")
+
+
+def resolve_variant(model, variant):
+    """Replie la variante demandee sur une variante acceptee par le modele.
+
+    Retourne None si le modele n'accepte aucune variante d'effort : le modele
+    sera alors utilise tel quel (son effort par defaut).
+    """
+    supported = MODEL_VARIANTS.get(model)
+    if supported is None:
+        # Modele inconnu du catalogue fige : on ne force rien (pas de variante).
+        return None
+    if not supported:
+        return None
+    if variant and variant in supported:
+        return variant
+    for candidate in _VARIANT_FALLBACK:
+        if candidate in supported:
+            return candidate
+    return None
+
+
+def _requested_effort(body):
+    """Extrait le niveau d'effort demande par Hermes dans le corps de la requete.
+
+    Hermes peut l'exprimer de plusieurs facons selon le transport :
+      - extra_body.reasoning.effort  (transport chat_completions standard)
+      - reasoning_effort             (niveau racine, ex. Kimi / TokenHub)
+      - extra_body.thinking.effort
+    On normalise vers les variantes OpenCode v2.
+    """
+    candidates = []
+
+    def _walk(node, depth=0):
+        if depth > 4 or not isinstance(node, dict):
+            return
+        for key in ("effort", "reasoning_effort"):
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip().lower())
+        for key in ("reasoning", "thinking", "extra_body"):
+            if key in node:
+                _walk(node[key], depth + 1)
+
+    _walk(body)
+
+    # Le corps peut aussi porter reasoning_effort a la racine.
+    root_effort = body.get("reasoning_effort")
+    if isinstance(root_effort, str) and root_effort.strip():
+        candidates.append(root_effort.strip().lower())
+
+    for value in candidates:
+        if value == "none":
+            return "minimal"
+        mapped = EFFORT_ALIASES.get(value)
+        if mapped:
+            return mapped
+    return None
+
+
+def split_variant(name):
+    """Separe ``provider/model#variant`` en (modele canonique, variante).
+
+    Retourne (modele, None) si aucune variante n'est demandee.
+    """
+    if not name:
+        return OC_MODEL, None
+    base, sep, variant = name.partition("#")
+    if not sep:
+        return oc_model(base), None
+    variant = variant.strip().lower()
+    if variant not in EFFORT_VARIANTS:
+        return oc_model(base), None
+    return oc_model(base), variant
+
+
 def oc_model(name):
+    """Resout le nom de modele vers son id canonique OpenCode."""
     if not name:
         return OC_MODEL
-    if name in MODELS:
-        return name
-    bare = name.split("/")[-1]
+    # On ignore un eventuel #variant pour la resolution de l'id.
+    base = name.split("#")[0]
+    if base in MODELS:
+        return base
+    bare = base.split("/")[-1]
     for model in MODELS:
         if model.split("/")[-1] == bare:
             return model
@@ -516,10 +631,13 @@ def extract_text(messages):
     return clean, calls, outcome or "idle", "\n".join(reasoning_parts).strip()
 
 
-def run_session(prompt, model):
+def run_session(prompt, model, variant=None):
     provider_id = model.split("/")[0]
     model_id = model.split("/")[-1]
     model_ref = {"providerID": provider_id, "id": model_id}
+    # La variante porte le niveau d'effort de raisonnement chez OpenCode v2.
+    if variant:
+        model_ref["variant"] = variant
 
     created = oc_request(
         "POST",
@@ -604,12 +722,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
         if path.endswith("/models"):
+            # Catalogue au format OpenRouter : Hermes y lit
+            # ``supported_parameters`` / ``reasoning`` pour savoir que la route
+            # accepte un controle de raisonnement, et donc envoyer l'effort
+            # demande par l'utilisateur (medium / high / max).
+            # Les niveaux proposes sont ceux que le modele accepte vraiment.
+            def _efforts_for(model_id):
+                supported = MODEL_VARIANTS.get(model_id)
+                if supported is None:
+                    return list(EFFORT_VARIANTS)
+                return [v for v in supported if v != "none"] or list(EFFORT_VARIANTS)
+
             return self._json(
                 200,
                 {
                     "object": "list",
                     "data": [
-                        {"id": m, "object": "model", "owned_by": "opencode-v2", "created": int(time.time())}
+                        {
+                            "id": m,
+                            "object": "model",
+                            "owned_by": "opencode-v2",
+                            "created": int(time.time()),
+                            "supported_parameters": ["reasoning", "tools", "tool_choice", "temperature"],
+                            "reasoning": {
+                                "supported_efforts": _efforts_for(m),
+                                "mandatory": False,
+                            },
+                        }
                         for m in MODELS
                     ],
                 },
@@ -645,7 +784,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _chat(self, body):
         want_stream = bool(body.get("stream"))
-        model = oc_model(body.get("model"))
+        model, variant = split_variant(body.get("model"))
+        # Hermes peut demander un niveau d'effort : soit via le nom du modele
+        # (#high), soit via extra_body.reasoning.effort / reasoning_effort.
+        # Chez OpenCode v2, l'effort est une VARIANTE du modele.
+        if not variant:
+            variant = _requested_effort(body)
+        # On replie la variante sur ce que le modele accepte vraiment : sinon
+        # la requete echoue (variant=minimal sur beam-free, par exemple).
+        variant = resolve_variant(model, variant)
         tools = body.get("tools") or []
         valid_names = client_tool_names(tools)
         schemas = tool_schemas(tools)
@@ -653,9 +800,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not prompt.strip():
             return self._json(400, {"error": {"message": "empty prompt"}})
 
-        text, calls, outcome, err, reasoning = run_session(prompt, model)
-        log("model=%s outcome=%s chars=%d calls=%d reasoning=%d chars"
-            % (model, outcome, len(text), len(calls), len(reasoning)))
+        text, calls, outcome, err, reasoning = run_session(prompt, model, variant)
+        log("model=%s variant=%s outcome=%s chars=%d calls=%d reasoning=%d chars"
+            % (model, variant or "-", outcome, len(text), len(calls), len(reasoning)))
 
         # Garde-fou : si la demande portait sur une action et que le modele
         # affirme l'avoir executee sans passer par un outil, on le rappelle
@@ -675,7 +822,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "shell ni aux fichiers. Tu dois repondre EXCLUSIVEMENT par un "
                     "bloc XML <tool_call ...> pour demander l'action au client."
                 )
-                text2, calls2, outcome2, err2, reasoning2 = run_session(retry_prompt, model)
+                text2, calls2, outcome2, err2, reasoning2 = run_session(retry_prompt, model, variant)
                 log("relance corrective: outcome=%s chars=%d calls=%d" % (outcome2, len(text2), len(calls2)))
                 if calls2:
                     text, calls = text2, calls2
@@ -786,9 +933,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         )
 
     def _anthropic(self, body):
-        model = oc_model(body.get("model"))
+        model, variant = split_variant(body.get("model"))
+        if not variant:
+            variant = _requested_effort(body)
+        variant = resolve_variant(model, variant)
         prompt = build_prompt(body.get("messages"), [])
-        text, calls, outcome, err, reasoning = run_session(prompt, model)
+        text, calls, outcome, err, reasoning = run_session(prompt, model, variant)
         content = []
         # Le protocole Anthropic attend un bloc "thinking" pour le raisonnement.
         if reasoning:
