@@ -224,15 +224,25 @@ def parse_xml_tool_calls(text):
         r"<tool_call\s+name=\"([^\"]+)\"\s*>(.*?)(?:</tool_call>|(?=<tool_call)|$)",
         re.S | re.I,
     )
-    arg_pattern = re.compile(r"<arg\s+key=\"([^\"]+)\"\s*>(.*?)(?:</arg>|(?=<arg)|$)", re.S | re.I)
+    # L'argument se termine sur </arg>, la balise suivante <arg>, OU une
+    # balise de fin mal nommee par le modele (</rfl:parameter>, </tool_call>).
+    arg_pattern = re.compile(
+        r"<arg\s+key=\"([^\"]+)\"\s*>(.*?)(?:</arg>|(?=<arg)|(?=</rfl:)|(?=</tool_call>)|$)",
+        re.S | re.I,
+    )
 
     for match in pattern.finditer(text):
         name = match.group(1).strip()
         args = {}
         for arg_match in arg_pattern.finditer(match.group(2)):
             value = arg_match.group(2).strip()
-            # nettoie les balises residuelles
-            value = re.sub(r"</?arg[^>]*>", "", value).strip()
+            # nettoie les balises residuelles : </arg>, mais aussi les balises
+            # de fin mal nommees par le modele (</rfl:parameter>, </tool_call>, ...).
+            value = re.sub(r"</?arg[^>]*>", "", value)
+            value = re.sub(r"</?rfl:[^>]*>", "", value)
+            value = re.sub(r"</?tool_call[^>]*>", "", value)
+            value = re.sub(r"^\s*</tool_call>\s*$", "", value)
+            value = value.strip()
             args[arg_match.group(1).strip()] = value
         calls.append((name, args))
     clean = re.sub(r"<tool_call.*?(?:</tool_call>|(?=<tool_call)|$)", "", text, flags=re.S | re.I).strip()
@@ -240,11 +250,25 @@ def parse_xml_tool_calls(text):
     return calls, clean
 
 
-def normalize_tool_name(name):
+def normalize_tool_name(name, valid_names=None):
+    """Resout le nom d'outil demande par le modele vers un nom d'outil Hermes.
+
+    Priorite :
+      1. la table de correspondance modele-opencode -> Hermes (read -> read_file,
+         shell -> terminal, write -> write_file, edit -> patch, ...) : c'est
+         elle qui garantit que le nom final existe COTE HERMES ;
+      2. le nom demande tel quel, s'il fait partie des outils que Hermes a
+         reellement envoyes dans la requete (memory, skill_view, ...) ;
+      3. None si l'outil est inconnu (l'appel est alors ignore).
+
+    ``valid_names`` est l'ensemble des noms d'outils reels de la requete.
+    """
     table = CLIENT_TOOLS["hermes"]
     if not name:
         return None
     candidate = name.strip()
+    # 1) Table OpenCode -> Hermes (prioritaire : le nom final doit exister
+    #    cote Hermes, sinon l'appel echoue).
     for oc_name, client_name in table.items():
         if candidate == client_name:
             return oc_name
@@ -254,7 +278,34 @@ def normalize_tool_name(name):
             return oc_name
     if low in table:
         return low
+    # 2) Outil Hermes direct (memory, skill_view, ...) : on garde le nom.
+    if valid_names:
+        for tool_name in valid_names:
+            if candidate == tool_name:
+                return candidate
     return None
+
+
+def hermes_tool_name(oc_name, valid_names=None):
+    """Nom FINAL du tool a appeler chez Hermes.
+
+    Pour les outils de la table (read, shell, ...) on renvoie le nom Hermes
+    correspondant. Pour un outil Hermes direct, on renvoie son propre nom.
+    """
+    table = CLIENT_TOOLS["hermes"]
+    if oc_name in table:
+        return table[oc_name]
+    if valid_names and oc_name in valid_names:
+        return oc_name
+    return table.get((oc_name or "").lower(), oc_name)
+
+
+def convert_args(oc_name, inp):
+    fn = CONVERT["hermes"].get((oc_name or "").lower())
+    if fn is None:
+        return dict(inp or {})
+    out = fn(inp or {})
+    return {k: v for k, v in out.items() if v is not None}
 
 
 _ACTION_PATTERNS = (
@@ -581,13 +632,67 @@ def oc_model(name):
 
 
 # ---------------------------------------------------------------- execution
-def extract_text(messages):
+def _native_tool_calls(tool_parts, valid_names):
+    """Convertit les parties `tool` natives d'OpenCode en tool_calls OpenAI.
+
+    OpenCode emet ses appels d'outils comme des parties ``{"type": "tool",
+    "name": ..., "state": {"input": {...}}}``. Quand la permission de l'agent
+    est ``deny``/``ask``, l'appel reste en attente (``executed: false``) :
+    c'est exactement l'appel que le CLIENT (Hermes) doit executer chez lui.
+    On les convertit donc en tool_calls OpenAI.
+    """
+    calls = []
+    for part in tool_parts or []:
+        if not isinstance(part, dict):
+            continue
+        name = part.get("name") or ""
+        state = part.get("state") or {}
+        status = state.get("status")
+        # Une partie deja executee par OpenCode (completed + executed=true)
+        # n'est PAS un appel a repasser au client : son resultat est deja connu.
+        if part.get("executed") is True and status == "completed":
+            continue
+        if status == "error":
+            continue
+        raw_input = state.get("input")
+        if isinstance(raw_input, str):
+            try:
+                raw_input = json.loads(raw_input)
+            except Exception:
+                raw_input = {"value": raw_input} if raw_input else {}
+        if not isinstance(raw_input, dict):
+            raw_input = {}
+
+        oc_name = normalize_tool_name(name, valid_names)
+        if not oc_name:
+            continue
+        calls.append(
+            {
+                "id": part.get("id") or "call_native_%02d" % len(calls),
+                "type": "function",
+                "function": {
+                    "name": hermes_tool_name(oc_name, valid_names),
+                    "arguments": json.dumps(convert_args(oc_name, raw_input)),
+                },
+            }
+        )
+    return calls
+
+
+def extract_text(messages, valid_names=None):
     """Retourne (texte, tool_calls_openai, statut, reasoning) depuis les messages OpenCode.
 
     OpenCode expose le raisonnement dans un bloc ``{"type": "reasoning", "text": ...}``
     avec ``native.reasoningField == "reasoning_content"``. Hermes (client
     OpenAI-compatible) attend ce texte dans le champ ``reasoning_content`` de la
     reponse : on le recovere pour qu'il soit affiche.
+
+    Le modele ecrit parfois le bloc XML ``<tool_call>`` dans le RAISONNEMENT
+    plutot que dans la reponse finale (il "pense" l'appel au lieu de
+    l'emettre). On le cherche donc dans les deux : un appel d'outil place dans
+    le raisonnement doit quand meme etre execute par Hermes.
+
+    ``valid_names`` = noms des outils que Hermes a reellement envoyes.
     """
     texts = []
     reasoning_parts = []
@@ -612,10 +717,23 @@ def extract_text(messages):
         elif kind == "idle":
             outcome = msg.get("outcome")
     full = "\n".join(texts)
+    reasoning = "\n".join(reasoning_parts).strip()
+
+    # 0) Appels d'outils NATIFS d'OpenCode (parties "tool") : c'est le
+    #    mecanisme principal. L'agent "cerveau" a les actions en deny/ask,
+    #    donc l'appel reste en attente : c'est Hermes qui doit l'executer.
+    calls = _native_tool_calls(tool_parts, valid_names)
+
+    # 1) Bloc XML dans la reponse finale (cas nominal du protocole XML).
     xml_calls, clean = parse_xml_tool_calls(full)
-    calls = []
+    # 2) Bloc XML dans le raisonnement (le modele "pense" l'appel) : on le
+    #    recupere aussi, sinon l'action demandee n'est jamais executee.
+    if not xml_calls and reasoning:
+        reasoning_calls, _ = parse_xml_tool_calls(reasoning)
+        xml_calls = reasoning_calls
+
     for name, args in xml_calls:
-        oc_name = normalize_tool_name(name)
+        oc_name = normalize_tool_name(name, valid_names)
         if not oc_name:
             continue
         calls.append(
@@ -623,15 +741,15 @@ def extract_text(messages):
                 "id": "call_xml_%02d" % len(calls),
                 "type": "function",
                 "function": {
-                    "name": CLIENT_TOOLS["hermes"][oc_name],
+                    "name": hermes_tool_name(oc_name, valid_names),
                     "arguments": json.dumps(convert_args(oc_name, args)),
                 },
             }
         )
-    return clean, calls, outcome or "idle", "\n".join(reasoning_parts).strip()
+    return clean, calls, outcome or "idle", reasoning
 
 
-def run_session(prompt, model, variant=None):
+def run_session(prompt, model, variant=None, valid_names=None):
     provider_id = model.split("/")[0]
     model_id = model.split("/")[-1]
     model_ref = {"providerID": provider_id, "id": model_id}
@@ -668,7 +786,7 @@ def run_session(prompt, model, variant=None):
         messages = (listed or {}).get("data") or []
         idle = [m for m in messages if isinstance(m, dict) and m.get("type") == "idle"]
         if idle:
-            text, calls, outcome, reasoning = extract_text(messages)
+            text, calls, outcome, reasoning = extract_text(messages, valid_names)
             if outcome == "failed":
                 err = None
                 for msg in idle:
@@ -680,7 +798,7 @@ def run_session(prompt, model, variant=None):
 
     listed = oc_request("GET", "/api/session/%s/message?order=asc&limit=100" % session_id, timeout=60)
     messages = (listed or {}).get("data") or []
-    text, calls, outcome, reasoning = extract_text(messages)
+    text, calls, outcome, reasoning = extract_text(messages, valid_names)
     return text, calls, outcome or "timeout", None, reasoning
 
 
@@ -800,7 +918,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not prompt.strip():
             return self._json(400, {"error": {"message": "empty prompt"}})
 
-        text, calls, outcome, err, reasoning = run_session(prompt, model, variant)
+        text, calls, outcome, err, reasoning = run_session(prompt, model, variant, valid_names)
         log("model=%s variant=%s outcome=%s chars=%d calls=%d reasoning=%d chars"
             % (model, variant or "-", outcome, len(text), len(calls), len(reasoning)))
 
@@ -819,10 +937,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     prompt
                     + "\n\n[CORRECTION] Ta reponse precedente affirme une execution "
                     "que tu n'as pas pu faire : c'est FAUX. Tu n'as aucun acces au "
-                    "shell ni aux fichiers. Tu dois repondre EXCLUSIVEMENT par un "
-                    "bloc XML <tool_call ...> pour demander l'action au client."
+                    "shell ni aux fichiers de l'utilisateur. Pour demander une "
+                    "action au client, appelle l'outil correspondant (read, "
+                    "terminal, write_file, ...) ou reponds par un bloc XML "
+                    "<tool_call ...>. N'affirme jamais avoir execute une commande "
+                    "ou cree un fichier."
                 )
-                text2, calls2, outcome2, err2, reasoning2 = run_session(retry_prompt, model, variant)
+                text2, calls2, outcome2, err2, reasoning2 = run_session(retry_prompt, model, variant, valid_names)
                 log("relance corrective: outcome=%s chars=%d calls=%d" % (outcome2, len(text2), len(calls2)))
                 if calls2:
                     text, calls = text2, calls2
@@ -937,8 +1058,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not variant:
             variant = _requested_effort(body)
         variant = resolve_variant(model, variant)
-        prompt = build_prompt(body.get("messages"), [])
-        text, calls, outcome, err, reasoning = run_session(prompt, model, variant)
+        valid_names = client_tool_names(body.get("tools") or [])
+        prompt = build_prompt(body.get("messages"), body.get("tools") or [])
+        text, calls, outcome, err, reasoning = run_session(prompt, model, variant, valid_names)
         content = []
         # Le protocole Anthropic attend un bloc "thinking" pour le raisonnement.
         if reasoning:
