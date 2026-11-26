@@ -465,8 +465,15 @@ def oc_model(name):
 
 # ---------------------------------------------------------------- execution
 def extract_text(messages):
-    """Retourne (texte, tool_calls_openai, statut) depuis les messages OpenCode."""
+    """Retourne (texte, tool_calls_openai, statut, reasoning) depuis les messages OpenCode.
+
+    OpenCode expose le raisonnement dans un bloc ``{"type": "reasoning", "text": ...}``
+    avec ``native.reasoningField == "reasoning_content"``. Hermes (client
+    OpenAI-compatible) attend ce texte dans le champ ``reasoning_content`` de la
+    reponse : on le recovere pour qu'il soit affiche.
+    """
     texts = []
+    reasoning_parts = []
     tool_parts = []
     outcome = None
     for msg in messages or []:
@@ -477,9 +484,13 @@ def extract_text(messages):
             for part in msg.get("content") or []:
                 if not isinstance(part, dict):
                     continue
-                if part.get("type") == "text" and part.get("text"):
+                part_type = part.get("type")
+                if part_type == "text" and part.get("text"):
                     texts.append(part["text"])
-                elif part.get("type") == "tool":
+                elif part_type == "reasoning":
+                    if part.get("text"):
+                        reasoning_parts.append(part["text"])
+                elif part_type == "tool":
                     tool_parts.append(part)
         elif kind == "idle":
             outcome = msg.get("outcome")
@@ -500,7 +511,7 @@ def extract_text(messages):
                 },
             }
         )
-    return clean, calls, outcome or "idle"
+    return clean, calls, outcome or "idle", "\n".join(reasoning_parts).strip()
 
 
 def run_session(prompt, model):
@@ -520,14 +531,14 @@ def run_session(prompt, model):
     )
     session_id = ((created or {}).get("data") or {}).get("id")
     if not session_id:
-        return "", [], "session-failed", (created or {})
+        return "", [], "session-failed", (created or {}), ""
 
     # Le modele est deja pose a la creation ; on le reaffirme pour être sûr.
     oc_request("POST", "/api/session/%s/model" % session_id, {"model": model_ref}, timeout=60)
 
     queued = oc_request("POST", "/api/session/%s/prompt" % session_id, {"text": prompt}, timeout=60)
     if queued and "_error" in queued:
-        return "", [], "prompt-failed", queued
+        return "", [], "prompt-failed", queued, ""
 
     deadline = time.time() + OC_TIMEOUT
     while time.time() < deadline:
@@ -537,20 +548,20 @@ def run_session(prompt, model):
         messages = (listed or {}).get("data") or []
         idle = [m for m in messages if isinstance(m, dict) and m.get("type") == "idle"]
         if idle:
-            text, calls, outcome = extract_text(messages)
+            text, calls, outcome, reasoning = extract_text(messages)
             if outcome == "failed":
                 err = None
                 for msg in idle:
                     if msg.get("error"):
                         err = msg["error"]
-                return text, calls, "failed", err
-            return text, calls, outcome or "idle", None
+                return text, calls, "failed", err, reasoning
+            return text, calls, outcome or "idle", None, reasoning
         time.sleep(1.0)
 
     listed = oc_request("GET", "/api/session/%s/message?order=asc&limit=100" % session_id, timeout=60)
     messages = (listed or {}).get("data") or []
-    text, calls, outcome = extract_text(messages)
-    return text, calls, outcome or "timeout", None
+    text, calls, outcome, reasoning = extract_text(messages)
+    return text, calls, outcome or "timeout", None, reasoning
 
 
 # ---------------------------------------------------------------- serveur
@@ -640,8 +651,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not prompt.strip():
             return self._json(400, {"error": {"message": "empty prompt"}})
 
-        text, calls, outcome, err = run_session(prompt, model)
-        log("model=%s outcome=%s chars=%d calls=%d" % (model, outcome, len(text), len(calls)))
+        text, calls, outcome, err, reasoning = run_session(prompt, model)
+        log("model=%s outcome=%s chars=%d calls=%d reasoning=%d chars"
+            % (model, outcome, len(text), len(calls), len(reasoning)))
 
         # Garde-fou : si la demande portait sur une action et que le modele
         # affirme l'avoir executee sans passer par un outil, on le rappelle
@@ -661,7 +673,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "shell ni aux fichiers. Tu dois repondre EXCLUSIVEMENT par un "
                     "bloc XML <tool_call ...> pour demander l'action au client."
                 )
-                text2, calls2, outcome2, err2 = run_session(retry_prompt, model)
+                text2, calls2, outcome2, err2, reasoning2 = run_session(retry_prompt, model)
                 log("relance corrective: outcome=%s chars=%d calls=%d" % (outcome2, len(text2), len(calls2)))
                 if calls2:
                     text, calls = text2, calls2
@@ -677,6 +689,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             }
                         },
                     )
+                if reasoning2:
+                    reasoning = reasoning2
 
         if outcome == "session-failed":
             return self._json(502, {"error": {"message": "opencode session failed", "detail": err}})
@@ -695,6 +709,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if want_stream:
             self._sse_start()
             base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_out}
+            # Le raisonnement arrive d'abord, dans un delta dedie : c'est le
+            # format qu'attend Hermes (delta.reasoning_content).
+            if reasoning:
+                self._sse(
+                    dict(
+                        base,
+                        choices=[
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "reasoning_content": reasoning},
+                                "finish_reason": None,
+                            }
+                        ],
+                    )
+                )
             if calls:
                 for index, call in enumerate(calls):
                     self._sse(
@@ -737,6 +766,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         msg = {"role": "assistant", "content": text}
+        if reasoning:
+            msg["reasoning_content"] = reasoning
         if calls:
             msg["tool_calls"] = calls
             msg["content"] = text or None
@@ -755,8 +786,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _anthropic(self, body):
         model = oc_model(body.get("model"))
         prompt = build_prompt(body.get("messages"), [])
-        text, calls, outcome, err = run_session(prompt, model)
+        text, calls, outcome, err, reasoning = run_session(prompt, model)
         content = []
+        # Le protocole Anthropic attend un bloc "thinking" pour le raisonnement.
+        if reasoning:
+            content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
         if text:
             content.append({"type": "text", "text": text})
         for call in calls:
