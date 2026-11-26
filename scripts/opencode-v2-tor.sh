@@ -47,9 +47,13 @@ echo "$TOR_PID" > "$PID_FILE"
 disown 2>/dev/null
 
 # Attente du SocksPort ET du fichier de cookie
-for _ in $(seq 1 45); do
+# NOTE : le fichier de cookie s'appelle "control_auth_cookie" (Tor 0.4.x).
+# Attendre "control_auth" ne le trouvait jamais -> 90 s d'attente puis un
+# echec alors que Tor demarrait parfaitement.
+COOKIE_FILE="$DATA_DIR/control_auth_cookie"
+for _ in $(seq 1 60); do
   sleep 2
-  if ss -ltn 2>/dev/null | grep -q ":$SOCKS_PORT " && [ -f "$DATA_DIR/control_auth" ]; then
+  if ss -ltn 2>/dev/null | grep -q ":$SOCKS_PORT " && [ -f "$COOKIE_FILE" ]; then
     echo "Tor dedie pret (pid $TOR_PID, socks $SOCKS_PORT)"
     exit 0
   fi

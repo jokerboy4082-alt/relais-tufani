@@ -54,11 +54,20 @@ load_gh_token() {
 }
 
 ensure_tor() {
-  # L'instance Tor dediee doit tourner : c'est elle qu'on peut faire tourner
-  # d'IP (l'instance systeme, root, garde le meme circuit).
-  if ! ss -ltn 2>/dev/null | grep -q ":$TOR_SOCKS_PORT "; then
-    log "Tor dedie absent -> demarrage"
-    timeout 120 /home/fantome/opencode-v2-tor.sh >> "$LOG" 2>&1 || log "ECHEC demarrage Tor dedie"
+  # L'instance Tor dediee est un SERVICE systemd separe
+  # (opencode-v2-tor.service). Le tunnel ne la demarre JAMAIS en inline :
+  # - Tor met ~90 s a bootstraper, un appel inline bloquait la boucle ;
+  # - Tor etait deja lance => conflit de ports 9150/9151 ("Address
+  #   already in use") et le tunnel partait en echec.
+  # On delegue a systemd et on ne bloque pas : le tunnel monte meme si Tor
+  # est lent, l'instance finira par etre prete pour la rotation d'IP.
+  if ! ss -ltn 2>/dev/null | grep -q ":$TOR_SOCKS_PORT"; then
+    log "Tor dedie absent -> delegation au service systemd (non bloquant)"
+    # systemd gere le demarrage et le bootstrap (~90 s) : on ne bloque pas la
+    # boucle de reconnexion du tunnel, sinon le port 8771 arrive tard.
+    ( timeout 30 systemctl --user restart opencode-v2-tor.service >> "$LOG" 2>&1 \
+      || log "ECHEC delegation systemctl opencode-v2-tor.service" ) &
+    disown 2>/dev/null || true
   fi
 }
 
@@ -67,20 +76,24 @@ push_tor_cookie() {
   # pour que rotate-tor.sh puisse envoyer SIGNAL NEWNYM.
   # On le pousse en HEX ASCII via base64 : le transport `cat >` de
   # `gh codespace ssh` convertit le binaire et corrompt le cookie.
-  if [ -s "$TOR_COOKIE" ]; then
-    local hex b64
-    hex=$(xxd -p "$TOR_COOKIE" | tr -d '\n')
-    b64=$(printf '%s' "$hex" | base64 -w0)
-    if timeout 40 gh codespace ssh -c "$CS" -- \
-      "echo '$b64' | base64 -d | tr -d '\n' > /home/codespace/opencode-v2/tor_cookie.hex && chmod 600 /home/codespace/opencode-v2/tor_cookie.hex && wc -c < /home/codespace/opencode-v2/tor_cookie.hex" \
-      >> "$LOG" 2>&1 < /dev/null; then
-      log "cookie ControlPort Tor pousse vers le codespace"
-    else
-      log "ECHEC push du cookie ControlPort"
-    fi
-  else
+  #
+  # IMPORTANT : ce push est fait EN ARRIERE-PLAN. Execute en inline il
+  # bloquait la boucle de reconnexion du tunnel (le service systemd restait
+  # occupe par cette commande au lieu de monter le port 8771).
+  if [ ! -s "$TOR_COOKIE" ]; then
     log "cookie ControlPort Tor absent ($TOR_COOKIE)"
+    return 0
   fi
+  local hex b64
+  hex=$(xxd -p "$TOR_COOKIE" | tr -d '\n')
+  b64=$(printf '%s' "$hex" | base64 -w0)
+  (
+    timeout 60 gh codespace ssh -c "$CS" -- \
+      "echo '$b64' | base64 -d | tr -d '\\n' > /home/codespace/opencode-v2/tor_cookie.hex && chmod 600 /home/codespace/opencode-v2/tor_cookie.hex" \
+      >> "$LOG" 2>&1 < /dev/null
+    log "cookie ControlPort Tor pousse vers le codespace"
+  ) &
+  disown 2>/dev/null || true
 }
 
 log "=== tunnel opencode-v2 demarre (pid $$) ==="
@@ -115,6 +128,30 @@ ensure_remote() {
   fi
 }
 
+purge_stale_forwards() {
+  # Une session SSH distante restee accrochee garde les forwards inverses
+  # 19050/19051 (Tor socks + control). Au remount, le nouveau tunnel echoue
+  # avec "remote port forwarding failed for listen port 19050" et
+  # ExitOnForwardFailure tue toute la session : plus de port 8771 => plus de
+  # pont.
+  #
+  # On tue les sessions sshd "codespace" qui ne sont PAS celle de la purge
+  # courante. Celle-ci est identifiee par son age : la purge vient de s'ouvrir
+  # (etimes < 60 s), les sessions orphelines sont plus anciennes.
+  local out
+  out=$(timeout 30 gh codespace ssh -c "$CS" -- \
+    "for p in \$(ps -eo pid,etimes,cmd 2>/dev/null | grep '[s]shd: codespace' | awk '{print \$1\" \"\$2}'); do
+       pid=\${p%% *}; age=\${p##* }
+       if [ \"\$age\" -gt 90 ] 2>/dev/null; then
+         kill -9 \$pid 2>/dev/null && echo KILLED:\$pid
+       fi
+     done; sleep 2; ss -ltn 2>/dev/null | grep -cE ':(19050|19051)' || true" \
+    >> "$LOG" 2>&1 < /dev/null || true)
+  if echo "$out" | grep -q "KILLED:"; then
+    log "sessions sshd orphelines purgees (forwards 19050/19051 liberes)"
+  fi
+}
+
 start_codespace() {
   local state
   state=$(timeout 25 gh api "/user/codespaces/$CS" --jq .state 2>/dev/null || echo unknown)
@@ -130,6 +167,10 @@ start_codespace() {
 while true; do
   start_codespace
   ensure_tor
+  # Libere les forwards inverses 19050/19051 detenus par une session SSH
+  # orpheline AVANT de monter le nouveau tunnel (sinon ExitOnForwardFailure
+  # tue la session et le port 8771 n'est jamais monte).
+  purge_stale_forwards
   push_tor_cookie
 
   log "ouverture tunnel $LOCAL_PORT -> $REMOTE_PORT + Tor inverse (socks $TOR_REMOTE_SOCKS, control $TOR_REMOTE_CONTROL)"
