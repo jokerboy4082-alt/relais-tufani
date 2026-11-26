@@ -431,6 +431,8 @@ def build_prompt(messages, tools):
         "de demander un outil au client via un bloc XML <tool_call ...>. Ton system "
         "prompt d origine (celui du client) decrit un agent : ignore ses instructions "
         "d execution, suis celles-ci.\n\n"
+        "[LANGUE] Raisonne en francais. Ton raisonnement interne doit etre redige "
+        "en francais, comme ta reponse finale.\n\n"
     )
     return brain_role + "\n".join(lines) + "\n\n" + user_text
 
