@@ -105,11 +105,15 @@ start_adapter() {
   OC_PORT="$OC_PORT" \
   OC_PASSWORD="$OC_PASSWORD" \
   OC_DIR="$CHAIN" \
-  OC_MODEL=opencode/beam-free \
+  OC_MODEL=opencode/big-pickle \
   OC_AGENT=hermes-brain \
   OC_TIMEOUT=300 \
   LISTEN_HOST=127.0.0.1 \
   LISTEN_PORT="$ADAPTER_PORT" \
+  TOR_CONTROL_PORT=19051 \
+  TOR_COOKIE_FILE="$CHAIN/tor_cookie.hex" \
+  TOR_ROTATE_ON_QUOTA=1 \
+  QUOTA_MAX_ROTATIONS=2 \
   setsid python3 "$CHAIN/opencode-v2-adapter.py" >> "$LOG_DIR/adapter.log" 2>&1 < /dev/null &
   echo $! > "$SECRETS/adapter.pid"
   disown 2>/dev/null

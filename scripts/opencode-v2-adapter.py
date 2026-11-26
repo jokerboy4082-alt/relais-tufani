@@ -19,6 +19,7 @@ import http.server
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -34,10 +35,21 @@ OC_MODEL = os.environ.get("OC_MODEL", "opencode/beam-free")
 OC_AGENT = os.environ.get("OC_AGENT", "hermes-brain")
 OC_TIMEOUT = int(os.environ.get("OC_TIMEOUT", "300"))
 
+# Rotation d'IP Tor (quota free OpenCode indexe sur l'IP de sortie).
+# Le ControlPort de l'instance Tor dediee du PC est expose en 19051 cote
+# Codespace par le tunnel SSH inverse ; le cookie d'auth (hex) est pousse
+# par le tunnel local au demarrage.
+TOR_CONTROL_PORT = int(os.environ.get("TOR_CONTROL_PORT", "19051"))
+TOR_COOKIE_FILE = os.environ.get("TOR_COOKIE_FILE", "/home/codespace/opencode-v2/tor_cookie.hex")
+TOR_ROTATE_ON_QUOTA = os.environ.get("TOR_ROTATE_ON_QUOTA", "1") == "1"
+QUOTA_MAX_ROTATIONS = int(os.environ.get("QUOTA_MAX_ROTATIONS", "2"))
+
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8771"))
 
 # Catalogue servi a Hermes (verifie sur opencode v2.4.1).
+# tidepool-alpha-free est RETIRE : il echoue en 502 sur le pont text-only
+# (modele vision cote opencode.ai, l'agent cerveau ne passe pas d'image).
 MODELS = [
     "opencode/beam-free",
     "opencode/big-pickle",
@@ -48,6 +60,7 @@ MODELS = [
     "opencode/mimo-v2.6-flash-free",
     "opencode/nemotron-3.5-lightning-free",
     "opencode/nemotron-3.5-super-vl-free",
+    "opencode/seaglass-alpha-free",
     "opencode/tidepool-alpha-free",
 ]
 
@@ -68,6 +81,66 @@ else:
 def log(msg):
     sys.stderr.write("[opencode-v2] " + str(msg) + "\n")
     sys.stderr.flush()
+
+
+def is_quota_error(err):
+    """Vrai si l'erreur OpenCode est un epuisement de quota free (429)."""
+    if not err:
+        return False
+    blob = json.dumps(err) if not isinstance(err, str) else err
+    blob = blob.lower()
+    return (
+        "free-limit" in blob
+        or "freeusagelimiterror" in blob
+        or "free usage limit" in blob
+        or "quota" in blob
+    )
+
+
+def rotate_tor_ip():
+    """Force un nouveau circuit Tor via le ControlPort expose (19051).
+
+    Le quota free OpenCode est indexe sur l'IP de sortie : un nouveau circuit
+    change l'IP et debloque. Le ControlPort est sur le PC (instance Tor
+    dediee) ; le tunnel SSH inverse l'expose en 19051 cote Codespace. Le
+    cookie d'auth (hex ASCII) a ete pousse par le tunnel local.
+    """
+    try:
+        with open(TOR_COOKIE_FILE, "r") as fh:
+            cookie_hex = fh.read().strip().replace("\n", "").replace("\r", "").replace(" ", "")
+    except Exception as exc:
+        log("rotation Tor impossible: cookie illisible (%r)" % exc)
+        return False
+    if not cookie_hex:
+        log("rotation Tor impossible: cookie vide")
+        return False
+    try:
+        sock = socket.create_connection(("127.0.0.1", TOR_CONTROL_PORT), timeout=15)
+    except Exception as exc:
+        log("rotation Tor impossible: ControlPort %d injoignable (%r)" % (TOR_CONTROL_PORT, exc))
+        return False
+    try:
+        sock.settimeout(15)
+        sock.sendall(b"AUTHENTICATE " + cookie_hex.encode("ascii") + b"\r\n")
+        auth = sock.recv(1024).decode("ascii", "replace").strip()
+        if not auth.startswith("250"):
+            log("rotation Tor: authentification refusee (%s)" % auth)
+            return False
+        sock.sendall(b"SIGNAL NEWNYM\r\n")
+        resp = sock.recv(1024).decode("ascii", "replace").strip()
+        if not resp.startswith("250"):
+            log("rotation Tor: SIGNAL NEWNYM refuse (%s)" % resp)
+            return False
+        log("rotation Tor: nouveau circuit demande")
+        return True
+    except Exception as exc:
+        log("rotation Tor: erreur (%r)" % exc)
+        return False
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
 
 
 def oc_request(method, path, payload=None, timeout=120):
@@ -526,16 +599,13 @@ EFFORT_ALIASES = {
 # lui en envoyer une fait echouer la requete. Les variantes non supportees
 # sont donc repliees sur la meilleure variante disponible.
 MODEL_VARIANTS = {
-    "opencode/tidepool-alpha-free": ("minimal", "low", "medium", "high", "xhigh", "max"),
-    "opencode/beam-free": ("low", "medium", "high", "xhigh", "max"),
-    "opencode/flint-40b-free": ("low", "medium", "high", "xhigh", "max"),
-    "opencode/deepseek-v4.1-flash-free": ("low", "high", "max"),
-    "opencode/hy4-flash-free": ("none", "high"),
-    "opencode/iceman-free": (),
-    "opencode/mimo-v2.6-flash-free": (),
-    "opencode/nemotron-3.5-lightning-free": (),
-    "opencode/big-pickle": (),
-    "opencode/nemotron-3.5-super-vl-free": (),
+    "opencode/beam-free": ["high", "low", "max", "medium", "xhigh"],
+    "opencode/deepseek-v4.1-flash-free": ["high", "low", "max"],
+    "opencode/flint-40b-free": ["high", "low", "max", "medium", "xhigh"],
+    "opencode/hy4-flash-free": ["high", "none"],
+    "opencode/nemotron-3.5-super-vl-free": ["high", "low", "medium", "minimal", "none", "xhigh"],
+    "opencode/seaglass-alpha-free": ["high", "low", "max", "medium", "minimal", "xhigh"],
+    "opencode/tidepool-alpha-free": ["high", "low", "max", "medium", "minimal", "xhigh"],
 }
 
 # Ordre de preference pour replier une variante non supportee.
@@ -749,7 +819,7 @@ def extract_text(messages, valid_names=None):
     return clean, calls, outcome or "idle", reasoning
 
 
-def run_session(prompt, model, variant=None, valid_names=None):
+def run_session(prompt, model, variant=None, valid_names=None, _rotation=0):
     provider_id = model.split("/")[0]
     model_id = model.split("/")[-1]
     model_ref = {"providerID": provider_id, "id": model_id}
@@ -769,6 +839,18 @@ def run_session(prompt, model, variant=None, valid_names=None):
     )
     session_id = ((created or {}).get("data") or {}).get("id")
     if not session_id:
+        # Le quota peut tomber dès la création de session (429 renvoyé par
+        # l'API). Meme traitement : rotation Tor + retry.
+        if (
+            TOR_ROTATE_ON_QUOTA
+            and is_quota_error(created)
+            and _rotation < QUOTA_MAX_ROTATIONS
+        ):
+            log("quota free epuise a la creation de session -> rotation Tor (%d/%d)"
+                % (_rotation + 1, QUOTA_MAX_ROTATIONS))
+            if rotate_tor_ip():
+                time.sleep(8)
+                return run_session(prompt, model, variant, valid_names, _rotation + 1)
         return "", [], "session-failed", (created or {}), ""
 
     # Le modele est deja pose a la creation ; on le reaffirme pour être sûr.
@@ -776,6 +858,16 @@ def run_session(prompt, model, variant=None, valid_names=None):
 
     queued = oc_request("POST", "/api/session/%s/prompt" % session_id, {"text": prompt}, timeout=60)
     if queued and "_error" in queued:
+        if (
+            TOR_ROTATE_ON_QUOTA
+            and is_quota_error(queued)
+            and _rotation < QUOTA_MAX_ROTATIONS
+        ):
+            log("quota free epuise a l'envoi du prompt -> rotation Tor (%d/%d)"
+                % (_rotation + 1, QUOTA_MAX_ROTATIONS))
+            if rotate_tor_ip():
+                time.sleep(8)
+                return run_session(prompt, model, variant, valid_names, _rotation + 1)
         return "", [], "prompt-failed", queued, ""
 
     deadline = time.time() + OC_TIMEOUT
@@ -792,6 +884,21 @@ def run_session(prompt, model, variant=None, valid_names=None):
                 for msg in idle:
                     if msg.get("error"):
                         err = msg["error"]
+                # Quota free epuise (429) : on force un nouveau circuit Tor
+                # (nouvelle IP de sortie) et on retente la requete.
+                if (
+                    TOR_ROTATE_ON_QUOTA
+                    and is_quota_error(err)
+                    and _rotation < QUOTA_MAX_ROTATIONS
+                ):
+                    log("quota free epuise -> rotation Tor + retry (%d/%d)"
+                        % (_rotation + 1, QUOTA_MAX_ROTATIONS))
+                    if rotate_tor_ip():
+                        # Laisse Tor etablir le nouveau circuit avant de reessayer.
+                        time.sleep(8)
+                        return run_session(
+                            prompt, model, variant, valid_names, _rotation + 1
+                        )
                 return text, calls, "failed", err, reasoning
             return text, calls, outcome or "idle", None, reasoning
         time.sleep(1.0)
@@ -914,6 +1021,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         tools = body.get("tools") or []
         valid_names = client_tool_names(tools)
         schemas = tool_schemas(tools)
+        log("outils recus de Hermes (%d): %s" % (len(valid_names), sorted(valid_names)))
         prompt = build_prompt(body.get("messages"), tools)
         if not prompt.strip():
             return self._json(400, {"error": {"message": "empty prompt"}})
@@ -963,10 +1071,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     reasoning = reasoning2
 
         if outcome == "session-failed":
+            if is_quota_error(err):
+                return self._json(
+                    429,
+                    {
+                        "error": {
+                            "message": "Quota free OpenCode epuise (rotation Tor deja tentee). "
+                                       "Reessaie apres le reset du quota.",
+                            "detail": err,
+                        }
+                    },
+                )
             return self._json(502, {"error": {"message": "opencode session failed", "detail": err}})
         if outcome == "prompt-failed":
+            if is_quota_error(err):
+                return self._json(
+                    429,
+                    {
+                        "error": {
+                            "message": "Quota free OpenCode epuise (rotation Tor deja tentee). "
+                                       "Reessaie apres le reset du quota.",
+                            "detail": err,
+                        }
+                    },
+                )
             return self._json(502, {"error": {"message": "opencode prompt failed", "detail": err}})
         if outcome == "failed":
+            if is_quota_error(err):
+                return self._json(
+                    429,
+                    {
+                        "error": {
+                            "message": "Quota free OpenCode epuise (rotation Tor deja tentee). "
+                                       "Reessaie apres le reset du quota.",
+                            "detail": err,
+                        }
+                    },
+                )
             return self._json(
                 502,
                 {"error": {"message": "opencode run failed", "detail": err}},
