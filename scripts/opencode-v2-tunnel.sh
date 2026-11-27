@@ -153,15 +153,38 @@ purge_stale_forwards() {
 }
 
 start_codespace() {
-  local state
+  local state tries
   state=$(timeout 25 gh api "/user/codespaces/$CS" --jq .state 2>/dev/null || echo unknown)
   log "etat du codespace: $state"
   if [ "$state" = "Available" ]; then
     return 0
   fi
-  timeout 25 gh api -X POST "/user/codespaces/$CS/start" >> "$LOG" 2>&1 \
-    && log "demarrage du codespace demande" \
-    || log "echec du demarrage du codespace"
+  # Demarrage. GitHub peut refuser si trop de codespaces demarrent en meme
+  # temps : on retente quelques fois au lieu de boucler en boucle.
+  for tries in 1 2 3; do
+    if timeout 25 gh api -X POST "/user/codespaces/$CS/start" >> "$LOG" 2>&1; then
+      log "demarrage du codespace demande (essai $tries)"
+      break
+    fi
+    log "echec du demarrage du codespace (essai $tries)"
+    sleep 10
+  done
+  # Attendre que le codespace soit REELLEMENT pret : sans cette attente, le
+  # tunnel ssh echoue ("too many codespaces starting") et le port 8771 reste
+  # ferme -> Hermes se fait refuser la connexion pendant ~1 minute.
+  for tries in $(seq 1 24); do
+    sleep 10
+    state=$(timeout 20 gh api "/user/codespaces/$CS" --jq .state 2>/dev/null || echo unknown)
+    if [ "$state" = "Available" ]; then
+      log "codespace pret (Available) apres $((tries * 10))s"
+      # Laisse le temps a opencode + au superviseur de demarrer.
+      sleep 12
+      return 0
+    fi
+    log "codespace encore $state, attente..."
+  done
+  log "codespace toujours indisponible apres 240s"
+  return 1
 }
 
 while true; do
@@ -173,33 +196,61 @@ while true; do
   purge_stale_forwards
   push_tor_cookie
 
-  log "ouverture tunnel $LOCAL_PORT -> $REMOTE_PORT + Tor inverse (socks $TOR_REMOTE_SOCKS, control $TOR_REMOTE_CONTROL)"
+  # Deux tentatives de montage :
+  #  1. avec les forwards inverses Tor (socks 19050 + control 19051) ;
+  #  2. SANS eux si le port distant est deja pris par une session orpheline.
+  #
+  # ExitOnForwardFailure=yes tue TOUTE la session quand un forward distant
+  # echoue : le port 8771 (le pont Hermes) ne monte jamais et Hermes se fait
+  # refuser la connexion. Les forwards Tor ne servent qu'a la rotation
+  # d'IP : ils ne doivent jamais empecher le pont de fonctionner.
+  # ATTEMPT / EXTRA_ARGS ne sont pas "local" : ce bloc est au top-level du
+  # script (pas dans une fonction), et "local" hors fonction fait echouer le
+  # script sous "set -u".
+  ATTEMPT=1
+  while [ "$ATTEMPT" -le 2 ]; do
+    EXTRA_ARGS=()
+    if [ "$ATTEMPT" -eq 1 ]; then
+      EXTRA_ARGS=(
+        -R "$TOR_REMOTE_SOCKS:127.0.0.1:$TOR_SOCKS_PORT"
+        -R "$TOR_REMOTE_CONTROL:127.0.0.1:$TOR_CONTROL_PORT"
+      )
+      log "ouverture tunnel $LOCAL_PORT -> $REMOTE_PORT + Tor inverse (socks $TOR_REMOTE_SOCKS, control $TOR_REMOTE_CONTROL)"
+    else
+      log "ouverture tunnel $LOCAL_PORT -> $REMOTE_PORT (SANS forwards Tor : ports distants occupes)"
+    fi
 
-  setsid gh codespace ssh -c "$CS" -- \
-    -N \
-    -L "$LOCAL_PORT:127.0.0.1:$REMOTE_PORT" \
-    -R "$TOR_REMOTE_SOCKS:127.0.0.1:$TOR_SOCKS_PORT" \
-    -R "$TOR_REMOTE_CONTROL:127.0.0.1:$TOR_CONTROL_PORT" \
-    -o ExitOnForwardFailure=yes \
-    -o ServerAliveInterval=20 \
-    -o ServerAliveCountMax=6 \
-    -o ConnectTimeout=20 \
-    >> "$LOG" 2>&1 < /dev/null &
-  TUNNEL_PID=$!
-  disown 2>/dev/null
+    setsid gh codespace ssh -c "$CS" -- \
+      -N \
+      -L "$LOCAL_PORT:127.0.0.1:$REMOTE_PORT" \
+      "${EXTRA_ARGS[@]}" \
+      -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=20 \
+      -o ServerAliveCountMax=6 \
+      -o ConnectTimeout=20 \
+      >> "$LOG" 2>&1 < /dev/null &
+    TUNNEL_PID=$!
+    disown 2>/dev/null
 
-  PORT_OK=0
-  for _ in $(seq 1 45); do
-    sleep 2
-    if ss -ltn 2>/dev/null | grep -q ":$LOCAL_PORT "; then
-      PORT_OK=1
-      log "port local pret (pid $TUNNEL_PID)"
+    PORT_OK=0
+    for _ in $(seq 1 45); do
+      sleep 2
+      if ss -ltn 2>/dev/null | grep -q ":$LOCAL_PORT "; then
+        PORT_OK=1
+        log "port local pret (pid $TUNNEL_PID)"
+        break
+      fi
+      if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        log "tunnel mort au demarrage"
+        break
+      fi
+    done
+
+    if [ "$PORT_OK" -eq 1 ]; then
       break
     fi
-    if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-      log "tunnel mort au demarrage"
-      break
-    fi
+    ATTEMPT=$((ATTEMPT + 1))
+    sleep 5
   done
 
   if [ "$PORT_OK" -eq 1 ]; then
