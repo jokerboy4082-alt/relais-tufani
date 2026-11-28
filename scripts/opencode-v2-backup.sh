@@ -44,19 +44,41 @@ load_gh_token || { log "ECHEC chargement du token GitHub"; exit 1; }
 log "token GitHub $GH_USER charge (len=${#GH_TOKEN})"
 
 # ---- 1. scripts du pont (non secrets) ----
-SCRIPTS="opencode-v2-adapter.py opencode-v2-http-socks-bridge.py opencode-v2-tor.sh opencode-v2-tor-rotate.py opencode-v2-rotate-tor-cs.sh opencode-v2-supervisor-cs.sh opencode-v2-tunnel.sh opencode-v2-deploy.sh opencode-v2-backup.sh opencode-v2-opencode.json"
+SCRIPTS="opencode-v2-adapter.py opencode-v2-http-socks-bridge.py opencode-v2-tor.sh opencode-v2-tor-rotate.py opencode-v2-rotate-tor-cs.sh opencode-v2-supervisor-cs.sh opencode-v2-tunnel.sh opencode-v2-deploy.sh opencode-v2-backup.sh opencode-v2-opencode.json opencode-v2-proxy.py"
 
 # ---- 2. etat OpenCode du Codespace ----
-if timeout 60 gh codespace ssh -c "$CS" -- 'cat $HOME/.config/opencode/opencode.json' > "$BACKUP_DIR/opencode.json" 2>/dev/null && [ -s "$BACKUP_DIR/opencode.json" ]; then
-  log "config opencode exportee"
-else
-  log "ECHEC export config opencode"
-fi
+# Le Codespace est ARRETE la plupart du temps (pont a la demande, quota
+# GitHub) : le SSH est alors indisponible. Le credential est donc exporte
+# depuis la copie LOCALE du backup precedent si le SSH echoue.
+CS_STATE=$(timeout 25 gh api "/user/codespaces/$CS" --jq .state 2>/dev/null || echo unknown)
+log "etat du codespace pour le backup: $CS_STATE"
 
-if timeout 60 gh codespace ssh -c "$CS" -- 'export PATH=$HOME/.opencode/bin:$PATH; opencode auth export' > "$BACKUP_DIR/auth.json" 2>/dev/null && [ -s "$BACKUP_DIR/auth.json" ]; then
-  log "credential opencode exporte"
+if [ "$CS_STATE" = "Available" ]; then
+  if timeout 60 gh codespace ssh -c "$CS" -- 'cat $HOME/.config/opencode/opencode.json' > "$BACKUP_DIR/opencode.json" 2>/dev/null && [ -s "$BACKUP_DIR/opencode.json" ]; then
+    log "config opencode exportee"
+  else
+    log "ECHEC export config opencode"
+  fi
+
+  if timeout 60 gh codespace ssh -c "$CS" -- 'export PATH=$HOME/.opencode/bin:$PATH; opencode auth export' > "$BACKUP_DIR/auth.json" 2>/dev/null && [ -s "$BACKUP_DIR/auth.json" ]; then
+    log "credential opencode exporte"
+  else
+    log "ECHEC export credential opencode"
+  fi
 else
-  log "ECHEC export credential opencode"
+  # Codespace eteint : on garde la DERNIERE version exportee (dechiffree puis
+  # rechiffree plus bas). Sans cela, le backup deviendrait irrestaurable.
+  if [ -s "$BACKUP_DIR/auth.json.enc" ] && [ -s "$STATE_DIR/passphrase" ] && command -v openssl >/dev/null 2>&1; then
+    openssl enc -d -aes-256-cbc -pbkdf2 -salt \
+      -in "$BACKUP_DIR/auth.json.enc" -out "$BACKUP_DIR/auth.json" \
+      -pass file:"$STATE_DIR/passphrase" 2>/dev/null \
+      && log "credential opencode reutilise depuis le backup (codespace eteint)" \
+      || log "ECHEC dechiffrement du credential precedent"
+  fi
+  if [ ! -s "$BACKUP_DIR/opencode.json" ] && [ -s "$STATE_DIR/opencode.json" ]; then
+    cp "$STATE_DIR/opencode.json" "$BACKUP_DIR/opencode.json"
+    log "config opencode reutilise depuis la copie locale"
+  fi
 fi
 
 # ---- 3. cookie ControlPort Tor (chiffre) ----
