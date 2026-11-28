@@ -1,22 +1,27 @@
 #!/bin/bash
-# Tunnel SSH durable vers le Codespace opencode-v2 (compte jokerboy4082-alt).
+# Tunnel SSH du pont OpenCode v2 — MODE A LA DEMANDE (économe en quota GitHub).
 #
-# DEUX TUNNELS SSH dans la meme session :
-#   -L 8771:127.0.0.1:8771   Hermes (PC) -> adaptateur (Codespace)
-#   -R 19050:127.0.0.1:9150  Codespace -> Tor dedie du PC (SocksPort)
-#   -R 19051:127.0.0.1:9151  Codespace -> ControlPort Tor du PC
+# PROBLEME
+# ---------
+# Le quota GitHub Codespaces d'un compte gratuit = 120 h de compute.
+# Une machine 2 cores compte DOUBLE (multiplicateur x2) => ~60 h reelles.
+# Un tunnel SSH permanent garde le Codespace "actif" 24/7 : l'idle_timeout
+# de 30 min ne se declenche jamais et le quota brule en continu.
+# (Mesure : 67 h de presence x2 = 134 h > 120 h => quota depasse, GitHub
+# renvoie alors HTTP 402 "billing issue" au demarrage.)
 #
-# Pourquoi : le quota free OpenCode est indexe sur l'IP de SORTIE. En passant
-# par Tor, cette IP change. Le ControlPort est aussi expose pour que le
-# pont, en detectant un quota epuise, force un nouveau circuit (SIGNAL NEWNYM).
+# SOLUTION
+# --------
+# Ce service ne maintient PLUS le tunnel en permanence. Il attend une
+# demande du proxy local (fichier "wake"), monte le tunnel SSH sur le port
+# TUNNEL_PORT, le garde ouvert tant qu'il y a de l'activite, puis le ferme.
+# Quand l'activite cesse depuis IDLE_MINUTES, il ARRETE le Codespace pour
+# ne plus facturer.
 #
-# PERMANENCE :
-#  - compte GitHub FORCE a jokerboy4082-alt ;
-#  - token lu dans un fichier dedie (mode 600) ;
-#  - le Codespace est redemarre via l'API s'il est arrete ;
-#  - le superviseur distant est relance s'il est mort ;
-#  - TOUTES les commandes gh ont un timeout (un reseau coupe ne doit jamais
-#    bloquer la boucle de reconnexion).
+#   Hermes -> proxy:8771 (toujours ouvert) -> [wake] -> tunnel:8772 -> codespace:8771
+#
+# Le proxy est le seul point que Hermes voit : il ne refuse JAMAIS une
+# connexion, il attend que le tunnel soit monte.
 set -u
 
 CS=opencode-v2-4j9j447xp7v435x76
@@ -27,13 +32,19 @@ TOR_SOCKS_PORT=9150
 TOR_CONTROL_PORT=9151
 TOR_COOKIE="$TOR_HOME/data/control_auth_cookie"
 LOCAL_PORT=8771
+TUNNEL_PORT=8772
 REMOTE_PORT=8771
 TOR_REMOTE_SOCKS=19050
 TOR_REMOTE_CONTROL=19051
+STATE_DIR=/home/fantome/.config/opencode-v2
+WAKE_FILE="$STATE_DIR/wake"
+IDLE_MINUTES=${IDLE_MINUTES:-10}
 LOG=/tmp/opencode-v2-tunnel.log
 export PATH=/home/fantome/.local/bin:/usr/local/bin:/usr/bin:/bin
 export GH_TOKEN=""
 export GITHUB_TOKEN=""
+
+mkdir -p "$STATE_DIR"
 
 log() { echo "[$(date +%H:%M:%S)] $*" >> "$LOG"; }
 
@@ -45,7 +56,6 @@ load_gh_token() {
       log "ERREUR token GitHub introuvable pour $GH_USER"
       return 1
     fi
-    mkdir -p "$(dirname "$GH_TOKEN_FILE")"
     printf '%s' "$t" > "$GH_TOKEN_FILE"
     chmod 600 "$GH_TOKEN_FILE"
   fi
@@ -54,17 +64,10 @@ load_gh_token() {
 }
 
 ensure_tor() {
-  # L'instance Tor dediee est un SERVICE systemd separe
-  # (opencode-v2-tor.service). Le tunnel ne la demarre JAMAIS en inline :
-  # - Tor met ~90 s a bootstraper, un appel inline bloquait la boucle ;
-  # - Tor etait deja lance => conflit de ports 9150/9151 ("Address
-  #   already in use") et le tunnel partait en echec.
-  # On delegue a systemd et on ne bloque pas : le tunnel monte meme si Tor
-  # est lent, l'instance finira par etre prete pour la rotation d'IP.
-  if ! ss -ltn 2>/dev/null | grep -q ":$TOR_SOCKS_PORT"; then
+  # Tor est un service systemd separe : on ne le demarre JAMAIS en inline
+  # (90 s de bootstrap + conflit de ports si deja lance).
+  if ! ss -ltn 2>/dev/null | grep -q ":$TOR_SOCKS_PORT "; then
     log "Tor dedie absent -> delegation au service systemd (non bloquant)"
-    # systemd gere le demarrage et le bootstrap (~90 s) : on ne bloque pas la
-    # boucle de reconnexion du tunnel, sinon le port 8771 arrive tard.
     ( timeout 30 systemctl --user restart opencode-v2-tor.service >> "$LOG" 2>&1 \
       || log "ECHEC delegation systemctl opencode-v2-tor.service" ) &
     disown 2>/dev/null || true
@@ -72,14 +75,9 @@ ensure_tor() {
 }
 
 push_tor_cookie() {
-  # Le cookie d'auth du ControlPort Tor doit etre accessible dans le Codespace
-  # pour que rotate-tor.sh puisse envoyer SIGNAL NEWNYM.
-  # On le pousse en HEX ASCII via base64 : le transport `cat >` de
-  # `gh codespace ssh` convertit le binaire et corrompt le cookie.
-  #
-  # IMPORTANT : ce push est fait EN ARRIERE-PLAN. Execute en inline il
-  # bloquait la boucle de reconnexion du tunnel (le service systemd restait
-  # occupe par cette commande au lieu de monter le port 8771).
+  # Pousse le cookie d'auth du ControlPort Tor dans le Codespace (hex ASCII
+  # via base64 : le transport "cat >" de gh codespace ssh corrompt le binaire).
+  # EN ARRIERE-PLAN : en inline il bloquait la boucle de reconnexion.
   if [ ! -s "$TOR_COOKIE" ]; then
     log "cookie ControlPort Tor absent ($TOR_COOKIE)"
     return 0
@@ -96,71 +94,17 @@ push_tor_cookie() {
   disown 2>/dev/null || true
 }
 
-log "=== tunnel opencode-v2 demarre (pid $$) ==="
-
-if [ -f /tmp/opencode-v2-tunnel.pid ]; then
-  OLD=$(cat /tmp/opencode-v2-tunnel.pid 2>/dev/null || true)
-  if [ -n "${OLD:-}" ] && kill -0 "$OLD" 2>/dev/null && [ "$OLD" != "$$" ]; then
-    log "tunnel deja actif (pid $OLD) -> rien a faire"
-    exit 0
-  fi
-fi
-echo $$ > /tmp/opencode-v2-tunnel.pid
-
-load_gh_token || exit 1
-ensure_tor
-
-if ss -ltn 2>/dev/null | grep -q ":$LOCAL_PORT "; then
-  OLD_PID=$(ss -ltnp 2>/dev/null | grep ":$LOCAL_PORT " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
-  if [ -n "${OLD_PID:-}" ]; then
-    kill -9 "$OLD_PID" 2>/dev/null && log "ancien tunnel $OLD_PID tue"
-  fi
-  sleep 2
-fi
-
-ensure_remote() {
-  if timeout 25 gh codespace ssh -c "$CS" -- \
-    "if [ -f /tmp/ocv2_supervisor.pid ] && kill -0 \$(cat /tmp/ocv2_supervisor.pid) 2>/dev/null; then echo SUP_ACTIF; else nohup bash /home/codespace/opencode-v2/start-supervisor.sh >/dev/null 2>&1 & echo SUP_RELANCE; fi" \
-    >> "$LOG" 2>&1 < /dev/null; then
-    log "superviseur distant verifie"
-  else
-    log "ECHEC supervision distante (timeout ou reseau indisponible)"
-  fi
-}
-
-purge_stale_forwards() {
-  # Une session SSH distante restee accrochee garde les forwards inverses
-  # 19050/19051 (Tor socks + control). Au remount, le nouveau tunnel echoue
-  # avec "remote port forwarding failed for listen port 19050" et
-  # ExitOnForwardFailure tue toute la session : plus de port 8771 => plus de
-  # pont.
-  #
-  # On tue les sessions sshd "codespace" qui ne sont PAS celle de la purge
-  # courante. Celle-ci est identifiee par son age : la purge vient de s'ouvrir
-  # (etimes < 60 s), les sessions orphelines sont plus anciennes.
-  local out
-  out=$(timeout 30 gh codespace ssh -c "$CS" -- \
-    "for p in \$(ps -eo pid,etimes,cmd 2>/dev/null | grep '[s]shd: codespace' | awk '{print \$1\" \"\$2}'); do
-       pid=\${p%% *}; age=\${p##* }
-       if [ \"\$age\" -gt 90 ] 2>/dev/null; then
-         kill -9 \$pid 2>/dev/null && echo KILLED:\$pid
-       fi
-     done; sleep 2; ss -ltn 2>/dev/null | grep -cE ':(19050|19051)' || true" \
-    >> "$LOG" 2>&1 < /dev/null || true)
-  if echo "$out" | grep -q "KILLED:"; then
-    log "sessions sshd orphelines purgees (forwards 19050/19051 liberes)"
-  fi
+codespace_state() {
+  timeout 25 gh api "/user/codespaces/$CS" --jq .state 2>/dev/null || echo unknown
 }
 
 start_codespace() {
   local state tries
-  state=$(timeout 25 gh api "/user/codespaces/$CS" --jq .state 2>/dev/null || echo unknown)
+  state=$(codespace_state)
   log "etat du codespace: $state"
   if [ "$state" = "Available" ]; then
     return 0
   fi
-  # Demarrage. GitHub peut refuser si trop de codespaces demarrent en meme
-  # temps : on retente quelques fois au lieu de boucler en boucle.
   for tries in 1 2 3; do
     if timeout 25 gh api -X POST "/user/codespaces/$CS/start" >> "$LOG" 2>&1; then
       log "demarrage du codespace demande (essai $tries)"
@@ -169,15 +113,13 @@ start_codespace() {
     log "echec du demarrage du codespace (essai $tries)"
     sleep 10
   done
-  # Attendre que le codespace soit REELLEMENT pret : sans cette attente, le
-  # tunnel ssh echoue ("too many codespaces starting") et le port 8771 reste
-  # ferme -> Hermes se fait refuser la connexion pendant ~1 minute.
+  # Attendre que le codespace soit REELLEMENT pret : sans cette attente le
+  # tunnel ssh echoue ("too many codespaces starting").
   for tries in $(seq 1 24); do
     sleep 10
-    state=$(timeout 20 gh api "/user/codespaces/$CS" --jq .state 2>/dev/null || echo unknown)
+    state=$(codespace_state)
     if [ "$state" = "Available" ]; then
       log "codespace pret (Available) apres $((tries * 10))s"
-      # Laisse le temps a opencode + au superviseur de demarrer.
       sleep 12
       return 0
     fi
@@ -187,43 +129,53 @@ start_codespace() {
   return 1
 }
 
-while true; do
-  start_codespace
-  ensure_tor
-  # Libere les forwards inverses 19050/19051 detenus par une session SSH
-  # orpheline AVANT de monter le nouveau tunnel (sinon ExitOnForwardFailure
-  # tue la session et le port 8771 n'est jamais monte).
-  purge_stale_forwards
-  push_tor_cookie
+stop_codespace() {
+  log "arret du codespace (inactivite > ${IDLE_MINUTES}min) -> economie de quota"
+  timeout 30 gh api -X POST "/user/codespaces/$CS/stop" >> "$LOG" 2>&1 \
+    && log "codespace arrete" \
+    || log "echec de l'arret du codespace"
+}
 
-  # Deux tentatives de montage :
-  #  1. avec les forwards inverses Tor (socks 19050 + control 19051) ;
-  #  2. SANS eux si le port distant est deja pris par une session orpheline.
-  #
-  # ExitOnForwardFailure=yes tue TOUTE la session quand un forward distant
-  # echoue : le port 8771 (le pont Hermes) ne monte jamais et Hermes se fait
-  # refuser la connexion. Les forwards Tor ne servent qu'a la rotation
-  # d'IP : ils ne doivent jamais empecher le pont de fonctionner.
-  # ATTEMPT / EXTRA_ARGS ne sont pas "local" : ce bloc est au top-level du
-  # script (pas dans une fonction), et "local" hors fonction fait echouer le
-  # script sous "set -u".
-  ATTEMPT=1
-  while [ "$ATTEMPT" -le 2 ]; do
-    EXTRA_ARGS=()
-    if [ "$ATTEMPT" -eq 1 ]; then
-      EXTRA_ARGS=(
+purge_stale_forwards() {
+  # Une session sshd orpheline garde les forwards inverses 19050/19051 ;
+  # au remont, ExitOnForwardFailure tue la session et le port 8772 ne
+  # monte jamais. On tue les sessions de plus de 90 s (la session courante
+  # de purge est plus jeune).
+  local out
+  out=$(timeout 30 gh codespace ssh -c "$CS" -- \
+    "for p in \$(ps -eo pid,etimes,cmd 2>/dev/null | grep '[s]shd: codespace' | awk '{print \$1\" \"\$2}'); do
+       pid=\${p%% *}; age=\${p##* }
+       if [ \"\$age\" -gt 90 ] 2>/dev/null; then
+         kill -9 \$pid 2>/dev/null && echo KILLED:\$pid
+       fi
+     done" \
+    >> "$LOG" 2>&1 < /dev/null || true)
+  if echo "$out" | grep -q "KILLED:"; then
+    log "sessions sshd orphelines purgees"
+  fi
+}
+
+mount_tunnel() {
+  # Deux tentatives : avec les forwards inverses Tor, puis SANS eux.
+  # ExitOnForwardFailure=yes avorte toute la session si un forward distant
+  # echoue : le pont (8772) ne doit jamais dependre de la rotation Tor.
+  local attempt=1
+  while [ "$attempt" -le 2 ]; do
+    local extra_args=()
+    if [ "$attempt" -eq 1 ]; then
+      extra_args=(
         -R "$TOR_REMOTE_SOCKS:127.0.0.1:$TOR_SOCKS_PORT"
         -R "$TOR_REMOTE_CONTROL:127.0.0.1:$TOR_CONTROL_PORT"
       )
-      log "ouverture tunnel $LOCAL_PORT -> $REMOTE_PORT + Tor inverse (socks $TOR_REMOTE_SOCKS, control $TOR_REMOTE_CONTROL)"
+      log "montage du tunnel $TUNNEL_PORT -> $REMOTE_PORT + Tor inverse"
     else
-      log "ouverture tunnel $LOCAL_PORT -> $REMOTE_PORT (SANS forwards Tor : ports distants occupes)"
+      log "montage du tunnel $TUNNEL_PORT -> $REMOTE_PORT (SANS forwards Tor)"
     fi
 
     setsid gh codespace ssh -c "$CS" -- \
       -N \
-      -L "$LOCAL_PORT:127.0.0.1:$REMOTE_PORT" \
-      "${EXTRA_ARGS[@]}" \
+      -L "$TUNNEL_PORT:127.0.0.1:$REMOTE_PORT" \
+      "${extra_args[@]}" \
       -o ExitOnForwardFailure=yes \
       -o ServerAliveInterval=20 \
       -o ServerAliveCountMax=6 \
@@ -232,12 +184,12 @@ while true; do
     TUNNEL_PID=$!
     disown 2>/dev/null
 
-    PORT_OK=0
+    local ok=0
     for _ in $(seq 1 45); do
       sleep 2
-      if ss -ltn 2>/dev/null | grep -q ":$LOCAL_PORT "; then
-        PORT_OK=1
-        log "port local pret (pid $TUNNEL_PID)"
+      if ss -ltn 2>/dev/null | grep -q ":$TUNNEL_PORT "; then
+        ok=1
+        log "tunnel monte sur $TUNNEL_PORT (pid $TUNNEL_PID)"
         break
       fi
       if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
@@ -245,40 +197,78 @@ while true; do
         break
       fi
     done
-
-    if [ "$PORT_OK" -eq 1 ]; then
-      break
+    if [ "$ok" -eq 1 ]; then
+      return 0
     fi
-    ATTEMPT=$((ATTEMPT + 1))
+    attempt=$((attempt + 1))
     sleep 5
   done
+  return 1
+}
 
-  if [ "$PORT_OK" -eq 1 ]; then
-    ensure_remote
-    while kill -0 "$TUNNEL_PID" 2>/dev/null; do
-      sleep 20
-      if ! ss -ltn 2>/dev/null | grep -q ":$LOCAL_PORT "; then
-        log "port disparu -> relance du tunnel"
-        break
-      fi
-      if curl -fsS --max-time 12 "http://127.0.0.1:$LOCAL_PORT/health" >/dev/null 2>&1; then
-        log "health OK"
-      else
-        log "health KO -> relance superviseur distant"
-        ensure_remote
-        if ! curl -fsS --max-time 12 "http://127.0.0.1:$LOCAL_PORT/health" >/dev/null 2>&1; then
-          log "tunnel toujours KO -> kill du processus gh ($TUNNEL_PID) et reconnexion"
-          kill -9 "$TUNNEL_PID" 2>/dev/null || true
-          pkill -P "$TUNNEL_PID" 2>/dev/null || true
-          break
-        fi
-      fi
-    done
-  else
-    log "tunnel non etabli -> le codespace sera relance au prochain tour"
+log "=== service tunnel opencode-v2 demarre (mode a la demande, idle=${IDLE_MINUTES}min) ==="
+load_gh_token || exit 1
+
+while true; do
+  # Attendre une demande du proxy (fichier "wake") ou une activite recente.
+  WAITING=0
+  while [ ! -f "$WAKE_FILE" ]; do
+    if [ "$WAITING" -eq 0 ]; then
+      log "en attente d'une requete (codespace arret possible)"
+      WAITING=1
+    fi
+    sleep 10
+  done
+  rm -f "$WAKE_FILE" 2>/dev/null || true
+
+  ensure_tor
+  start_codespace || { log "demarrage du codespace impossible"; sleep 30; continue; }
+  purge_stale_forwards
+  push_tor_cookie
+
+  if ! mount_tunnel; then
+    log "montage du tunnel impossible -> nouvel essai dans 20s"
     sleep 20
+    continue
   fi
 
-  log "tunnel arrete, relance dans 5s"
+  # Superviseur distant : opencode + adaptateur doivent tourner.
+  timeout 25 gh codespace ssh -c "$CS" -- \
+    "if [ -f /tmp/ocv2_supervisor.pid ] && kill -0 \$(cat /tmp/ocv2_supervisor.pid) 2>/dev/null; then echo SUP_ACTIF; else nohup bash /home/codespace/opencode-v2/start-supervisor.sh >/dev/null 2>&1 & echo SUP_RELANCE; fi" \
+    >> "$LOG" 2>&1 < /dev/null || log "ECHEC supervision distante"
+
+  # Surveiller l'activite : le proxy ecrit dans last_activity a chaque
+  # requete. Sans requete depuis IDLE_MINUTES, on ferme le tunnel et on
+  # ARRETE le codespace (c'est lui qui brule le quota).
+  LAST_SEEN=$(date +%s)
+  while kill -0 "$TUNNEL_PID" 2>/dev/null; do
+    sleep 20
+    ACT=$(cat "$STATE_DIR/last_activity" 2>/dev/null || echo 0)
+    case "$ACT" in
+      ''|*[!0-9]*) ACT=0 ;;
+    esac
+    NOW=$(date +%s)
+    if [ "$ACT" -gt 0 ]; then
+      DIFF=$((NOW - ACT))
+      LAST_SEEN=$ACT
+      if [ "$DIFF" -lt 300 ]; then
+        # activite recente : on garde le tunnel
+        continue
+      fi
+    else
+      DIFF=$((NOW - LAST_SEEN))
+      if [ "$DIFF" -lt 300 ]; then
+        continue
+      fi
+    fi
+    log "inactivite de $((DIFF / 60)) min -> fermeture du tunnel"
+    kill -9 "$TUNNEL_PID" 2>/dev/null || true
+    pkill -P "$TUNNEL_PID" 2>/dev/null || true
+    sleep 3
+    stop_codespace
+    break
+  done
+
+  log "tunnel arrete, retour en attente"
   sleep 5
 done
